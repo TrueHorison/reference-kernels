@@ -176,3 +176,44 @@ def test_determinism_settings_are_restored_on_exception(load_problem):
         torch.backends.cudnn.allow_tf32,
     )
     assert after == before
+
+
+def _conv2d_case(channels, kernelsize, size, seed=7):
+    gen = torch.Generator().manual_seed(seed)
+    x = torch.randn(1, channels, size, size, generator=gen)
+    w = torch.randn(channels, channels, kernelsize, kernelsize, generator=gen)
+    out = torch.empty(1, channels, size - kernelsize + 1, size - kernelsize + 1)
+    return x, w, out
+
+
+def test_conv2d_accepts_float64_exact_and_plain_float32(load_problem):
+    # C=128, k=32 sums 131072 products. Plain float32 is off by about 1e-3 at
+    # the median and 2e-2 at the max against float64, which the old fixed
+    # atol=1e-3 against a float32 reference could not tell apart from a bug.
+    ref = load_problem("conv2d")
+    data = _conv2d_case(128, 32, 36)
+    exact = torch.nn.functional.conv2d(data[0].double(), data[1].double()).float()
+    plain = torch.nn.functional.conv2d(data[0], data[1])
+    assert ref.check_implementation(data, exact)[0]
+    assert ref.check_implementation(data, plain)[0]
+
+
+@pytest.mark.parametrize("bug", ("window", "channel", "noise", "tf32"))
+def test_conv2d_still_rejects_wrong_results(bug, load_problem):
+    ref = load_problem("conv2d")
+    x, w, out = data = _conv2d_case(128, 32, 36)
+    exact = torch.nn.functional.conv2d(x.double(), w.double()).float()
+    if bug == "window":
+        wrong = torch.nn.functional.conv2d(x, w.roll(1, dims=2))
+    elif bug == "channel":
+        wrong = exact.roll(1, dims=1)
+    elif bug == "noise":
+        gen = torch.Generator().manual_seed(3)
+        wrong = exact * (1 + 1e-2 * torch.randn(exact.shape, generator=gen))
+    else:
+        # Round inputs to 10 mantissa bits, like TF32 tensor cores.
+        def trunc(t):
+            return ((t.view(torch.int32) + 0x1000) & ~0x1FFF).view(torch.float32)
+
+        wrong = torch.nn.functional.conv2d(trunc(x), trunc(w))
+    assert not ref.check_implementation(data, wrong)[0]
